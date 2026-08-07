@@ -19,6 +19,11 @@ use std::time::SystemTime;
 pub enum ContractError {
     #[error("path escapes scoped root: {0}")]
     PathEscape(String),
+    /// The string is not a valid [`ScopedPath`]. Distinct from
+    /// `PathEscape`, which means a well-formed path that leaves the root:
+    /// this means the spelling itself has no portable meaning.
+    #[error("not a portable scoped path: {0}")]
+    InvalidPath(String),
     #[error("not found: {0}")]
     NotFound(String),
     #[error("permission denied: {0}")]
@@ -48,6 +53,139 @@ impl From<std::io::Error> for ContractError {
 }
 
 pub type Result<T, E = ContractError> = std::result::Result<T, E>;
+
+/// A portable, relative path: the *only* thing [`FsRoot`] accepts.
+///
+/// Always `/`-separated, always relative, and validated at construction so
+/// that an unrepresentable path cannot reach an adapter. The rejections are
+/// not stylistic — each one is a spelling that means different things on
+/// different hosts, measured rather than assumed:
+///
+/// - **`:`** — a literal filename character on Linux, an alternate-data-stream
+///   selector on Windows. This is the one that *must* be a type error:
+///   writing `d.txt:s` returns `Ok` on both hosts and leaves `d.txt`
+///   unchanged on both, so the divergence is **invisible to any runtime
+///   check**. Nothing but rejecting the spelling can catch it.
+/// - **`\`** — a legal filename character on Linux, the native separator on
+///   Windows. Same shape of problem as `:`.
+/// - **leading `/`, drive prefixes (`C:`), UNC/device prefixes (`\\`)** —
+///   host roots. A scoped path names something *inside* a root; it cannot
+///   carry a root of its own.
+/// - **`.` / `..` components** — `..` yields `PathEscape`, preserving that
+///   category while moving enforcement to construction, where an escaping
+///   path becomes unrepresentable rather than merely rejected later.
+///
+/// Layer-1 responsibility: paths
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ScopedPath(String);
+
+impl ScopedPath {
+    /// Validates and builds a scoped path. See the type docs for why each
+    /// rejection exists.
+    pub fn new(input: &str) -> Result<Self> {
+        if input.is_empty() {
+            return Err(ContractError::InvalidPath("empty path".into()));
+        }
+        if input.starts_with('/') {
+            return Err(ContractError::PathEscape(format!(
+                "{input}: absolute paths name a host root, not a scoped location"
+            )));
+        }
+        if let Some(bad) = input.chars().find(|c| *c == ':' || *c == '\\') {
+            return Err(ContractError::InvalidPath(format!(
+                "{input}: {bad:?} has no portable meaning (ADS selector or separator on \
+                 Windows, an ordinary filename character on Unix)"
+            )));
+        }
+
+        let mut components = 0usize;
+        for component in input.split('/') {
+            match component {
+                ".." => {
+                    return Err(ContractError::PathEscape(format!(
+                        "{input}: `..` cannot appear in a scoped path"
+                    )))
+                }
+                "." => {
+                    return Err(ContractError::InvalidPath(format!(
+                        "{input}: `.` is not a portable component"
+                    )))
+                }
+                "" => {
+                    return Err(ContractError::InvalidPath(format!(
+                        "{input}: empty component (leading, trailing, or doubled `/`)"
+                    )))
+                }
+                _ => components += 1,
+            }
+        }
+        debug_assert!(components > 0);
+        Ok(ScopedPath(input.to_string()))
+    }
+
+    /// The `/`-separated spelling. Identical on every host, and safe both to
+    /// show a human and to hand back to [`ScopedPath::new`].
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Components, in order. Never empty, never `.` or `..`.
+    pub fn components(&self) -> impl Iterator<Item = &str> {
+        self.0.split('/')
+    }
+}
+
+impl std::fmt::Display for ScopedPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A host-native resolved path — **opaque on purpose**.
+///
+/// This is what the host says a path really is, and the contract makes no
+/// promise about its spelling. On Windows it is typically the verbatim
+/// `\\?\C:\...` form; on Unix a plain `/`-rooted path. Measured, on the same
+/// file:
+///
+/// ```text
+/// Windows -> \\?\C:\Users\...\real.txt
+/// Linux   -> /tmp/.../real.txt
+/// ```
+///
+/// That is why there is no `/`-normalized rendering here and why the type
+/// hides its contents. The previous contract promised paths that were
+/// canonical *and* `/`-normalized in one breath; on Windows those are
+/// mutually exclusive, because verbatim paths do not accept `/` as a
+/// separator. Splitting the two is the fix.
+///
+/// Layer-1 responsibility: paths
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativePath(PathBuf);
+
+impl NativePath {
+    /// Wraps a host-resolved path. Adapters only.
+    pub fn from_host(path: PathBuf) -> Self {
+        NativePath(path)
+    }
+
+    /// The native path, for handing straight back to a host API.
+    pub fn as_os_path(&self) -> &Path {
+        &self.0
+    }
+
+    /// A **human-facing rendering only.**
+    ///
+    /// Never pass the result to a host API and never treat it as canonical:
+    /// it is lossy for non-UTF-8 names, and on Windows it deliberately strips
+    /// the verbatim `\\?\` prefix for readability, which produces a string
+    /// the OS may resolve differently than the original. Use
+    /// [`NativePath::as_os_path`] for anything the machine will act on.
+    pub fn display_for_humans(&self) -> String {
+        let raw = self.0.to_string_lossy();
+        raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_string()
+    }
+}
 
 /// Per-host capability flags. Tools MUST check the relevant flag before
 /// depending on non-baseline behavior instead of branching on `cfg!(windows)`
@@ -114,17 +252,37 @@ pub struct DirEntryInfo {
     pub metadata: Metadata,
 }
 
-/// Filesystem operations scoped to a single root directory. No path passed
-/// to these methods may escape the root — implementations MUST return
-/// `ContractError::PathEscape` rather than silently resolving `..`.
+/// Filesystem operations scoped to a single root directory.
+///
+/// Takes [`ScopedPath`] rather than `&Path` so that escaping and
+/// non-portable spellings are rejected at construction — an unrepresentable
+/// path never reaches an adapter. Adapters MUST still enforce scoping
+/// themselves: a symlink inside the root pointing out of it is a valid
+/// `ScopedPath` and can only be caught during resolution.
+///
 /// Layer-1 responsibility: filesystem
 pub trait FsRoot {
-    fn stat(&self, path: &Path) -> Result<Metadata>;
-    fn read_dir(&self, path: &Path) -> Result<Vec<DirEntryInfo>>;
-    fn read_to_string(&self, path: &Path) -> Result<String>;
-    fn write(&self, path: &Path, contents: &[u8]) -> Result<()>;
-    fn create_dir(&self, path: &Path) -> Result<()>;
-    fn remove_file(&self, path: &Path) -> Result<()>;
+    fn stat(&self, path: &ScopedPath) -> Result<Metadata>;
+    fn read_dir(&self, path: &ScopedPath) -> Result<Vec<DirEntryInfo>>;
+    fn read_to_string(&self, path: &ScopedPath) -> Result<String>;
+    fn write(&self, path: &ScopedPath, contents: &[u8]) -> Result<()>;
+    fn create_dir(&self, path: &ScopedPath) -> Result<()>;
+    fn remove_file(&self, path: &ScopedPath) -> Result<()>;
+
+    /// Lists the root directory itself.
+    ///
+    /// A separate operation because `ScopedPath` deliberately cannot spell
+    /// "the root": every value has at least one real component, since `.` is
+    /// not a portable component. Naming the root explicitly is clearer than
+    /// a magic path value that every adapter would have to special-case.
+    fn read_dir_root(&self) -> Result<Vec<DirEntryInfo>>;
+
+    /// Resolves a scoped path to what the host says it actually is.
+    ///
+    /// Exists so [`NativePath`] has a real producer. A type with no way to
+    /// obtain it would be another documented guarantee with nothing behind
+    /// it, which is the failure this contract keeps having to correct.
+    fn canonicalize(&self, path: &ScopedPath) -> Result<NativePath>;
 }
 
 /// A process to spawn. `inherit_env` selects between "start from the
@@ -257,8 +415,8 @@ pub trait LockGuard {
 /// that ignore the lock can still race. See CONTRACT.md.
 /// Layer-1 responsibility: locking
 pub trait FileLock {
-    fn lock_exclusive(&self, path: &Path) -> Result<Box<dyn LockGuard>>;
-    fn lock_shared(&self, path: &Path) -> Result<Box<dyn LockGuard>>;
+    fn lock_exclusive(&self, path: &ScopedPath) -> Result<Box<dyn LockGuard>>;
+    fn lock_shared(&self, path: &ScopedPath) -> Result<Box<dyn LockGuard>>;
 }
 
 /// Deterministic per-OS config/cache/data directories for a named app.
@@ -286,6 +444,101 @@ mod tests {
         let spec = ProcessSpec::new("echo").arg("a").arg("b");
         assert_eq!(spec.args, vec!["a".to_string(), "b".to_string()]);
         assert!(spec.inherit_env);
+    }
+
+    #[test]
+    fn scoped_path_accepts_portable_relative_spellings() {
+        for good in ["a.txt", "a/b/c.txt", "dir/file", "weird name.txt", "dot."] {
+            assert!(
+                ScopedPath::new(good).is_ok(),
+                "{good:?} should be a valid scoped path"
+            );
+        }
+        let p = ScopedPath::new("a/b/c.txt").unwrap();
+        assert_eq!(p.as_str(), "a/b/c.txt");
+        assert_eq!(p.components().collect::<Vec<_>>(), ["a", "b", "c.txt"]);
+        // The `/` spelling is identical on every host and round-trips.
+        assert_eq!(ScopedPath::new(p.as_str()).unwrap(), p);
+    }
+
+    #[test]
+    fn scoped_path_rejects_colon_because_the_divergence_is_invisible() {
+        // Measured on both hosts: writing `d.txt:s` returns Ok and leaves
+        // `d.txt` unchanged on Windows *and* Linux — but on Windows it is a
+        // stream attached to `d.txt`, and on Linux a file literally named
+        // `d.txt:s`. No runtime check can tell those apart, so rejecting the
+        // spelling is the only place the difference can be caught.
+        assert!(matches!(
+            ScopedPath::new("d.txt:s"),
+            Err(ContractError::InvalidPath(_))
+        ));
+        assert!(matches!(
+            ScopedPath::new("C:foo"),
+            Err(ContractError::InvalidPath(_))
+        ));
+    }
+
+    #[test]
+    fn scoped_path_rejects_backslash_for_the_same_reason_as_colon() {
+        // A separator on Windows, an ordinary filename character on Linux.
+        assert!(matches!(
+            ScopedPath::new(r"a\b"),
+            Err(ContractError::InvalidPath(_))
+        ));
+    }
+
+    #[test]
+    fn scoped_path_rejects_host_roots() {
+        // Absolute spellings name a host root; a scoped path names something
+        // inside one. UNC and drive spellings are caught by the backslash or
+        // colon rule, a leading `/` by the root rule.
+        assert!(matches!(
+            ScopedPath::new("/etc/passwd"),
+            Err(ContractError::PathEscape(_))
+        ));
+        assert!(ScopedPath::new(r"\\srv\share\f").is_err());
+        assert!(ScopedPath::new(r"C:\x").is_err());
+    }
+
+    #[test]
+    fn scoped_path_makes_escape_unrepresentable_and_keeps_the_category() {
+        // `..` still yields `PathEscape` — the category survives, the
+        // enforcement just moves to construction, where an escaping path
+        // cannot be built rather than being rejected on use.
+        for escaping in ["../outside", "a/../../outside", ".."] {
+            assert!(
+                matches!(ScopedPath::new(escaping), Err(ContractError::PathEscape(_))),
+                "{escaping:?} should be PathEscape"
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_path_rejects_degenerate_shapes() {
+        for bad in ["", "a//b", "a/", "/", "./a", "a/./b"] {
+            assert!(
+                ScopedPath::new(bad).is_err(),
+                "{bad:?} should not be a valid scoped path"
+            );
+        }
+    }
+
+    #[test]
+    fn native_path_hides_its_spelling_but_renders_for_humans() {
+        // The contract promises nothing about the native spelling. It does
+        // promise the human rendering is readable, and that the two are
+        // allowed to differ — which is exactly what the old single promise
+        // ("canonical AND /-normalized") got wrong.
+        let verbatim = NativePath::from_host(PathBuf::from(r"\\?\C:\dir\f.txt"));
+        assert_eq!(verbatim.display_for_humans(), r"C:\dir\f.txt");
+        assert_eq!(
+            verbatim.as_os_path(),
+            Path::new(r"\\?\C:\dir\f.txt"),
+            "as_os_path must hand back the untouched host spelling"
+        );
+
+        let plain = NativePath::from_host(PathBuf::from("/tmp/f.txt"));
+        assert_eq!(plain.display_for_humans(), "/tmp/f.txt");
     }
 
     #[test]

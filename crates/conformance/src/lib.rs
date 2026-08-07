@@ -37,7 +37,8 @@ use compat::{
     NativeCapabilities, NativeProcessRunner, NativePtySession, NativeStandardDirs, Workspace,
 };
 use contract::{
-    ContractError, FileLock, FsRoot, ProcessRunner, ProcessSpec, PtySession, PtySpawn, StandardDirs,
+    ContractError, FileLock, FsRoot, ProcessRunner, ProcessSpec, PtySession, PtySpawn, ScopedPath,
+    StandardDirs,
 };
 
 /// How a primitive behaves on the host that ran the probe.
@@ -127,10 +128,38 @@ pub const PROBES: &[Probe] = &[
         run: probe_fs_scoped_ops,
     },
     Probe {
-        id: "fs_escape_lexical",
-        row: "Scoped-root escape -> `PathEscape`",
+        id: "fs_escape_construction",
+        row: "Escaping spellings unrepresentable (`ScopedPath`)",
         condition: None,
-        run: probe_fs_escape_lexical,
+        run: probe_fs_escape_rejected_at_construction,
+    },
+    Probe {
+        id: "path_case_collision",
+        row: "Scoped-root filename case collision",
+        condition: Some(
+            "filesystem case sensitivity is a property of the volume, not the OS; a name-keyed allow-list is bypassable by case wherever names collide",
+        ),
+        run: probe_path_case_collision,
+    },
+    Probe {
+        id: "path_device_names",
+        row: "Reserved device names in a scoped root",
+        condition: Some(
+            "Windows reserves CON/NUL/PRN/AUX/COM*/LPT*; Unix treats them as ordinary filenames, so the same create succeeds or fails per host",
+        ),
+        run: probe_path_device_names,
+    },
+    Probe {
+        id: "path_ads_unrepresentable",
+        row: "`:` rejected before the filesystem (ADS)",
+        condition: None,
+        run: probe_path_ads_is_unrepresentable,
+    },
+    Probe {
+        id: "path_native_canonical",
+        row: "Native canonical path shape (no `/` promise)",
+        condition: None,
+        run: probe_path_native_canonical,
     },
     Probe {
         id: "fs_escape_symlink",
@@ -227,6 +256,12 @@ pub fn run_all() -> Vec<ProbeResult> {
 // Probe helpers
 // ---------------------------------------------------------------------------
 
+/// Builds a `ScopedPath` inside a probe, turning a construction failure
+/// into a probe error rather than a panic.
+fn sp(input: &str) -> Result<ScopedPath, String> {
+    ScopedPath::new(input).map_err(|e| format!("ScopedPath::new({input:?}): {e}"))
+}
+
 fn unique_temp_dir(tag: &str) -> Result<PathBuf, String> {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -264,6 +299,7 @@ fn child_binary() -> Result<PathBuf, String> {
 fn error_category(err: &ContractError) -> &'static str {
     match err {
         ContractError::PathEscape(_) => "PathEscape",
+        ContractError::InvalidPath(_) => "InvalidPath",
         ContractError::NotFound(_) => "NotFound",
         ContractError::PermissionDenied(_) => "PermissionDenied",
         ContractError::Unsupported(_) => "Unsupported",
@@ -279,118 +315,199 @@ fn probe_fs_scoped_ops() -> Result<(Verdict, String), String> {
     let tmp = unique_temp_dir("fs")?;
     let ws = Workspace::open_ambient(&tmp).map_err(|e| e.to_string())?;
 
-    ws.write(Path::new("a.txt"), b"payload")
+    ws.write(&sp("a.txt")?, b"payload")
         .map_err(|e| format!("write: {e}"))?;
     let read = ws
-        .read_to_string(Path::new("a.txt"))
+        .read_to_string(&sp("a.txt")?)
         .map_err(|e| format!("read: {e}"))?;
     if read != "payload" {
         return Err(format!("roundtrip mismatch: {read:?}"));
     }
-    let meta = ws
-        .stat(Path::new("a.txt"))
-        .map_err(|e| format!("stat: {e}"))?;
+    let meta = ws.stat(&sp("a.txt")?).map_err(|e| format!("stat: {e}"))?;
     if meta.len != 7 || meta.is_dir {
         return Err(format!("unexpected metadata: {meta:?}"));
     }
-    ws.create_dir(Path::new("sub"))
+    ws.create_dir(&sp("sub")?)
         .map_err(|e| format!("create_dir: {e}"))?;
     let entries = ws
-        .read_dir(Path::new("."))
-        .map_err(|e| format!("read_dir: {e}"))?;
+        .read_dir_root()
+        .map_err(|e| format!("read_dir_root: {e}"))?;
     let mut names: Vec<_> = entries.iter().map(|e| e.name.clone()).collect();
     names.sort();
     if names != ["a.txt", "sub"] {
         return Err(format!("unexpected listing: {names:?}"));
     }
-    ws.remove_file(Path::new("a.txt"))
+    ws.remove_file(&sp("a.txt")?)
         .map_err(|e| format!("remove_file: {e}"))?;
 
     std::fs::remove_dir_all(&tmp).ok();
     Ok((
         Verdict::Supported,
-        "write/read/stat/create_dir/read_dir/remove all behave identically".to_string(),
+        "write/read/stat/create_dir/read_dir_root/remove all behave identically".to_string(),
     ))
 }
 
-fn probe_fs_escape_lexical() -> Result<(Verdict, String), String> {
-    let tmp = unique_temp_dir("escape")?;
-    std::fs::create_dir_all(tmp.join("root")).map_err(|e| e.to_string())?;
-    std::fs::write(tmp.join("outside.txt"), b"secret").map_err(|e| e.to_string())?;
-    let ws = Workspace::open_ambient(&tmp.join("root")).map_err(|e| e.to_string())?;
-
-    let absolute = tmp.join("outside.txt");
-    let attempts: Vec<(&str, Result<(), ContractError>)> = vec![
-        (
-            "../outside.txt",
-            ws.read_to_string(Path::new("../outside.txt")).map(|_| ()),
-        ),
-        ("..", ws.read_dir(Path::new("..")).map(|_| ())),
-        (
-            "a/../../outside.txt",
-            ws.read_to_string(Path::new("a/../../outside.txt"))
-                .map(|_| ()),
-        ),
-        ("<absolute>", ws.stat(&absolute).map(|_| ())),
-        (
-            "write ../evil.txt",
-            ws.write(Path::new("../evil.txt"), b"x"),
-        ),
-    ];
-
+/// Escape is now rejected when a `ScopedPath` is *built*, not when it is
+/// used, so this probe exercises the type rather than the filesystem.
+///
+/// That is the substantive change: an escaping path is unrepresentable, so
+/// no adapter can receive one. The `PathEscape` category survives — it is
+/// what construction returns.
+fn probe_fs_escape_rejected_at_construction() -> Result<(Verdict, String), String> {
+    let escaping = ["../outside", "a/../../outside", "..", "/etc/passwd"];
     let mut wrong = Vec::new();
-    for (label, outcome) in &attempts {
-        match outcome {
+    for candidate in escaping {
+        match ScopedPath::new(candidate) {
             Err(ContractError::PathEscape(_)) => {}
-            Err(other) => wrong.push(format!("{label} -> {}", error_category(other))),
-            Ok(()) => wrong.push(format!("{label} -> ESCAPED (allowed!)")),
+            Err(other) => wrong.push(format!("{candidate} -> {}", error_category(&other))),
+            Ok(_) => wrong.push(format!("{candidate} -> CONSTRUCTED (should be impossible)")),
         }
     }
     if !wrong.is_empty() {
-        return Err(format!(
-            "not classified as PathEscape: {}",
-            wrong.join(", ")
-        ));
+        return Err(format!("not rejected as PathEscape: {}", wrong.join(", ")));
     }
 
-    // The guard must not over-reject: `a/../b` never leaves the root.
-    ws.create_dir(Path::new("a")).map_err(|e| e.to_string())?;
-    ws.create_dir(Path::new("b")).map_err(|e| e.to_string())?;
-    ws.write(Path::new("b/inside.txt"), b"ok")
-        .map_err(|e| e.to_string())?;
-    let interior = ws
-        .read_to_string(Path::new("a/../b/inside.txt"))
-        .map_err(|e| format!("interior `..` wrongly rejected: {e}"))?;
-    if interior != "ok" {
-        return Err("interior `..` returned wrong contents".to_string());
+    // Non-portable spellings are a different category: the path does not
+    // escape, it simply has no host-independent meaning.
+    let non_portable = ["d.txt:s", r"a\b", "C:foo", "a//b", "./a", ""];
+    let mut leaked = Vec::new();
+    for candidate in non_portable {
+        if !matches!(
+            ScopedPath::new(candidate),
+            Err(ContractError::InvalidPath(_))
+        ) {
+            leaked.push(candidate);
+        }
+    }
+    if !leaked.is_empty() {
+        return Err(format!("not rejected as InvalidPath: {leaked:?}"));
     }
 
-    std::fs::remove_dir_all(&tmp).ok();
     Ok((
         Verdict::Supported,
         format!(
-            "{} escape shapes classified `PathEscape`; interior `a/../b` still resolves",
-            attempts.len()
+            "{} escaping spellings rejected `PathEscape`, {} non-portable rejected `InvalidPath`",
+            escaping.len(),
+            non_portable.len()
         ),
     ))
 }
 
-/// Downgrades a measured symlink verdict to [`Verdict::Varies`] on hosts
-/// whose OS gates symlink creation behind a privilege.
+/// Measures whether the scoped root treats two spellings that differ only
+/// in case as one file. Host-dependent and security-relevant: a tool that
+/// keys an allow-list on a filename is bypassable by case wherever this
+/// reports a collision.
+fn probe_path_case_collision() -> Result<(Verdict, String), String> {
+    let tmp = unique_temp_dir("case")?;
+    let ws = Workspace::open_ambient(&tmp).map_err(|e| e.to_string())?;
+
+    ws.write(&sp("Collide.txt")?, b"first")
+        .map_err(|e| e.to_string())?;
+    let lower = ws.read_to_string(&sp("collide.txt")?);
+    std::fs::remove_dir_all(&tmp).ok();
+
+    match lower {
+        Ok(contents) if contents == "first" => Ok((
+            Verdict::Varies,
+            "`Collide.txt` and `collide.txt` are the SAME file on this host".to_string(),
+        )),
+        Ok(other) => Err(format!(
+            "unexpected contents through the other case: {other:?}"
+        )),
+        Err(_) => Ok((
+            Verdict::Varies,
+            "`Collide.txt` and `collide.txt` are DISTINCT files on this host".to_string(),
+        )),
+    }
+}
+
+/// Measures reserved device names inside a scoped root.
+fn probe_path_device_names() -> Result<(Verdict, String), String> {
+    let tmp = unique_temp_dir("device")?;
+    let ws = Workspace::open_ambient(&tmp).map_err(|e| e.to_string())?;
+
+    let mut observed = Vec::new();
+    for name in ["CON", "NUL"] {
+        let outcome = match ws.write(&sp(name)?, b"x") {
+            Ok(()) => "ordinary file".to_string(),
+            Err(e) => format!("refused ({})", error_category(&e)),
+        };
+        observed.push(format!("{name}: {outcome}"));
+    }
+    std::fs::remove_dir_all(&tmp).ok();
+
+    Ok((Verdict::Varies, observed.join("; ")))
+}
+
+/// The `:` spelling never reaches the filesystem — `ScopedPath` rejects it.
 ///
-/// This is the one place a probe consults `cfg!` for something other than an
-/// API, and it stays inside the module rule because it does not decide the
-/// *answer* — the answer is measured, and the caller's `detail` still reports
-/// exactly what this machine did. It decides whether that answer **is
-/// assumable for the OS**, which is a documented property of the platform's
-/// security model rather than an observation about this host: Windows gates
-/// symlink creation on Developer Mode or `SeCreateSymbolicLinkPrivilege`, so
-/// whichever way one Windows machine answers, another may legitimately
-/// answer the other way. Linux and macOS have no such gate, so there a
-/// single measurement does generalize.
-///
-/// The evidence for this being right rather than theoretical: three real
-/// Windows hosts were measured and two refused with `os error 1314`
+/// This probe records *why* that rejection is a type error rather than a
+/// measured divergence: both hosts accept `d.txt:s` through raw `cap-std`
+/// and leave `d.txt` unchanged, so the difference between "a stream on
+/// d.txt" and "a file named d.txt:s" is **invisible to observation**. A
+/// matrix row cannot capture it; only the type can.
+fn probe_path_ads_is_unrepresentable() -> Result<(Verdict, String), String> {
+    if !matches!(
+        ScopedPath::new("d.txt:s"),
+        Err(ContractError::InvalidPath(_))
+    ) {
+        return Err("`:` reached the filesystem layer; it must be a construction error".into());
+    }
+    Ok((
+        Verdict::Supported,
+        "`:` rejected by ScopedPath on every host — the ADS/filename divergence it would \
+         cause is not observable at runtime, so it cannot be a measured row"
+            .to_string(),
+    ))
+}
+
+/// Records what the host calls a canonical path, and proves the contract
+/// does not claim it is `/`-normalized.
+fn probe_path_native_canonical() -> Result<(Verdict, String), String> {
+    let tmp = unique_temp_dir("canon")?;
+    let ws = Workspace::open_ambient(&tmp).map_err(|e| e.to_string())?;
+    ws.write(&sp("f.txt")?, b"x").map_err(|e| e.to_string())?;
+
+    let native = ws
+        .canonicalize(&sp("f.txt")?)
+        .map_err(|e| format!("canonicalize: {e}"))?;
+    let raw = native.as_os_path().to_string_lossy().into_owned();
+    let shown = native.display_for_humans();
+    std::fs::remove_dir_all(&tmp).ok();
+
+    let verbatim = raw.starts_with(r"\\?\");
+    let slash_normalized = !raw.contains('\\');
+    let verdict = if verbatim || !slash_normalized {
+        // Windows: verbatim and backslash-separated. Exactly the reason the
+        // old single promise could not hold.
+        Verdict::Normalized
+    } else {
+        Verdict::Supported
+    };
+    Ok((
+        verdict,
+        format!(
+            "native is {}; human rendering {}",
+            if verbatim {
+                "verbatim-prefixed"
+            } else if slash_normalized {
+                "`/`-separated"
+            } else {
+                "backslash-separated"
+            },
+            if shown.starts_with(r"\\?\") {
+                "still carries the verbatim prefix (BUG)"
+            } else if !verbatim {
+                // No prefix to drop on this host; say so rather than
+                // claiming a transformation that did not happen.
+                "equals the native spelling (nothing to strip)"
+            } else {
+                "drops the verbatim prefix"
+            }
+        ),
+    ))
+}
+
 /// (`ERROR_PRIVILEGE_NOT_HELD`) while the `windows-latest` runner succeeded.
 fn symlink_summary_verdict(measured: Verdict) -> Verdict {
     if cfg!(windows) {
@@ -418,7 +535,7 @@ fn probe_fs_escape_symlink() -> Result<(Verdict, String), String> {
     }
 
     let ws = Workspace::open_ambient(&root).map_err(|e| e.to_string())?;
-    let outcome = ws.read_to_string(Path::new("link"));
+    let outcome = ws.read_to_string(&sp("link")?);
     let result = match &outcome {
         Ok(contents) if contents == "secret" => {
             return Err("SECURITY: symlink escaped the scoped root".to_string())
@@ -613,7 +730,7 @@ fn probe_lock_advisory() -> Result<(Verdict, String), String> {
     let ws = Workspace::open_ambient(&tmp).map_err(|e| e.to_string())?;
 
     let guard = ws
-        .lock_exclusive(Path::new("lockfile"))
+        .lock_exclusive(&sp("lockfile")?)
         .map_err(|e| format!("lock_exclusive: {e}"))?;
     let second = std::fs::OpenOptions::new()
         .read(true)

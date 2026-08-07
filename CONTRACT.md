@@ -12,7 +12,7 @@ Windows (MSVC), Linux, macOS. x86_64 and aarch64.
 
 | Primitive | Guarantee | Backing crate |
 |---|---|---|
-| Paths | Canonical, absolute, `/`-normalized-for-display paths; capability-scoped roots (no `..`-escape) | `cap-std` |
+| Paths | Three separate concepts, never one value — `ScopedPath` (portable, relative, `/`-separated, the only thing `FsRoot` accepts), an opaque native canonical path with **no** `/` promise, and a human-only display rendering. See [Path semantics](#path-semantics). | `contract`, `cap-std` |
 | Filesystem ops | Open/read/write/stat/list/create/remove within a scoped root | `cap-std` |
 | File locking | Advisory exclusive/shared locks, best-effort on all hosts | `std::fs::File` (stable since 1.89) |
 | Process spawn | Spawn with explicit argv/env/cwd, inherit or capture stdout/stderr, block until exit | `std::process` |
@@ -20,6 +20,69 @@ Windows (MSVC), Linux, macOS. x86_64 and aarch64.
 | Environment variables | Read/write current-process env as UTF-8 `HashMap<String, String>` | `std::env` |
 | Standard directories | Per-OS config/cache/data dirs for a named app, deterministic | `dirs` |
 | Errors | Structured `ContractError` — `PathEscape`/`NotFound`/`PermissionDenied`/`Unsupported` are stable categories; `Io` is the explicit fallback with the OS error retained as `source` for diagnostics only, never for callers to match on | `thiserror` |
+
+## Path semantics
+
+The previous version of this row promised *"canonical, absolute,
+`/`-normalized-for-display paths"* as one value. **That is not merely
+unimplemented — it cannot be satisfied.** Measured on the same file:
+
+```
+Windows   canonicalize -> \\?\C:\Users\...\real.txt
+Linux     canonicalize -> /tmp/.../real.txt
+```
+
+Windows canonical form is the verbatim `\\?\` prefix, and **verbatim paths do
+not accept `/` as a separator.** "Canonical" and "`/`-normalized" are mutually
+exclusive there. So the promise is split into three concepts that are never
+the same value:
+
+| Concept | What it is | Promise |
+|---|---|---|
+| **`ScopedPath`** | A portable, relative, `/`-separated path. The only thing `FsRoot` accepts. | Identical spelling on every host; round-trips through `ScopedPath::new` |
+| **Native canonical** (`NativePath`) | What the host says a path really is. Opaque. | Resolves. **No** promise about its spelling — it may be verbatim |
+| **Display** (`display_for_humans`) | Human-facing rendering only | Readable. Never pass it to a host API; never treat it as canonical |
+
+### What `ScopedPath` rejects, and why
+
+Each rejection is a spelling that means different things on different hosts.
+These were measured, not assumed:
+
+- **`:`** — an ADS selector on Windows, an ordinary filename character on
+  Linux. **This one must be a type error.** Writing `d.txt:s` returns `Ok` on
+  both hosts and leaves `d.txt` unchanged on both, so the difference between
+  "a stream attached to `d.txt`" and "a file named `d.txt:s`" is **invisible
+  to any runtime check**. It cannot be a measured matrix row; only rejecting
+  the spelling catches it.
+- **`\`** — a separator on Windows, an ordinary filename character on Linux.
+  Same shape of problem.
+- **leading `/`, drive prefixes, UNC/device prefixes** — host roots. A scoped
+  path names something *inside* a root and cannot carry one.
+- **`..`** — returns `PathEscape`, the same category as before. The
+  enforcement simply moved to construction, so an escaping path is now
+  **unrepresentable** rather than rejected on use.
+
+### Deliberately not in this slice
+
+No `/c/Users` ↔ `C:\Users` translation, and no API that accepts a user-typed
+path. That work needs a **typed path intent** — relative, POSIX-absolute, or
+Windows-drive-absolute — converted at an explicit resolver.
+
+It must not be inferred from argv or arbitrary text. MSYS2's heuristic
+string-rewrite is the documented, recurring source of its own bugs
+(`MSYS_NO_PATHCONV` exists to switch it off when it guesses wrong), and the
+measurement above shows why the guess is unavoidable: `/tmp/x` is absolute on
+Linux and *relative* on Windows, `C:\foo` the reverse. **The same string
+legitimately means different things**, so shape alone cannot recover intent.
+
+### Known gap: case-insensitive name collision
+
+Where `path_case_collision` reports a collision, two spellings differing only
+in case are the same file. Any allow-list or deny-list a tool keys on a
+filename is **bypassable by case on those hosts**. This is measured and
+recorded rather than silently case-folded — the contract does not pretend the
+hosts agree. Callers that need name-based authorization must fold case
+themselves, on hosts where the matrix says it matters.
 
 ## Capability model
 

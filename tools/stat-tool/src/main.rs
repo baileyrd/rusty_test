@@ -1,39 +1,58 @@
 //! Reference tool 1: lists a directory and stats each entry through a
 //! contract-scoped `FsRoot`. Exercises the filesystem primitive only —
 //! no process spawn, no PTY.
-
-use std::path::Path;
+//!
+//! Also the first place the path boundary is visible. Everything this tool
+//! accepts must be a `ScopedPath`, so a non-portable spelling is refused
+//! with the contract's own error rather than guessed at. There is
+//! deliberately no translation of user input yet — `/c/Users`-style
+//! spellings are a later, typed API, not a string rewrite here.
 
 use compat::{NativeCapabilities, Workspace};
-use contract::FsRoot;
+use contract::{FsRoot, ScopedPath};
 
 fn main() -> anyhow::Result<()> {
-    let target = std::env::args().nth(1).unwrap_or_else(|| ".".to_string());
-    let target_path = Path::new(&target);
-    let root = target_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let name = target_path
-        .file_name()
-        .map(Path::new)
-        .unwrap_or(Path::new("."));
+    let ws = Workspace::open_ambient(std::path::Path::new("."))?;
+    println!("capabilities: {:?}", NativeCapabilities::detect());
 
-    let ws = Workspace::open_ambient(root)?;
-    let caps = NativeCapabilities::detect();
-    println!("capabilities: {caps:?}");
+    let Some(arg) = std::env::args().nth(1) else {
+        print_listing(ws.read_dir_root()?);
+        return Ok(());
+    };
 
-    let meta = ws.stat(name)?;
-    if meta.is_dir {
-        println!("{:<32} {:>10} {:>6} {:>6}", "name", "bytes", "dir", "link");
-        for entry in ws.read_dir(name)? {
-            println!(
-                "{:<32} {:>10} {:>6} {:>6}",
-                entry.name, entry.metadata.len, entry.metadata.is_dir, entry.metadata.is_symlink
+    // The boundary: an unportable spelling stops here, named.
+    let path = match ScopedPath::new(&arg) {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("stat-tool: {e}");
+            eprintln!(
+                "  paths are `/`-separated and relative to the current directory; \
+                 drive letters, `\\`, `:` and `..` are not portable spellings"
             );
+            std::process::exit(2);
         }
+    };
+
+    let meta = ws.stat(&path)?;
+    if meta.is_dir {
+        print_listing(ws.read_dir(&path)?);
     } else {
-        println!("{target}: {} bytes, readonly={}", meta.len, meta.readonly);
+        println!(
+            "{path}: {} bytes, readonly={}, native={}",
+            meta.len,
+            meta.readonly,
+            ws.canonicalize(&path)?.display_for_humans()
+        );
     }
     Ok(())
+}
+
+fn print_listing(entries: Vec<contract::DirEntryInfo>) {
+    println!("{:<32} {:>10} {:>6} {:>6}", "name", "bytes", "dir", "link");
+    for entry in entries {
+        println!(
+            "{:<32} {:>10} {:>6} {:>6}",
+            entry.name, entry.metadata.len, entry.metadata.is_dir, entry.metadata.is_symlink
+        );
+    }
 }

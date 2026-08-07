@@ -9,60 +9,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use contract::{
-    Capabilities, ContractError, DirEntryInfo, FileLock, FsRoot, LockGuard, Metadata,
+    Capabilities, ContractError, DirEntryInfo, FileLock, FsRoot, LockGuard, Metadata, NativePath,
     ProcessOutput, ProcessRunner, ProcessSpec, PtyControl, PtySession, PtySpawn, Result,
-    StandardDirs,
+    ScopedPath, StandardDirs,
 };
-
-/// Lexically simulates `..` resolution to decide whether `path` would climb
-/// above the scoped root at any point, or is rooted/absolute to begin with.
-///
-/// This exists because cap-std reports an escape attempt as a plain
-/// `io::ErrorKind::PermissionDenied`, which is indistinguishable from a
-/// genuine OS denial without matching on the error's message text — exactly
-/// what CONTRACT.md forbids callers from doing. Classifying structurally, at
-/// the boundary where we know the operation was scoped, keeps
-/// `ContractError::PathEscape` reachable and precise.
-///
-/// Deliberately *not* an unconditional `..` rejection: `a/../b` stays inside
-/// the root and cap-std accepts it, so rejecting it here would narrow the
-/// contract for no security gain.
-fn escapes_lexically(path: &Path) -> bool {
-    use std::path::Component;
-
-    let mut depth: i32 = 0;
-    for component in path.components() {
-        match component {
-            // An absolute path or a Windows drive/UNC prefix is not scoped
-            // to the root at all.
-            Component::Prefix(_) | Component::RootDir => return true,
-            Component::ParentDir => {
-                depth -= 1;
-                if depth < 0 {
-                    return true;
-                }
-            }
-            Component::Normal(_) => depth += 1,
-            Component::CurDir => {}
-        }
-    }
-    false
-}
-
-/// Guard applied to every scoped path before it reaches cap-std. cap-std
-/// remains the enforcement backstop — this only makes the *category* stable.
-///
-/// Known divergence: escape via a symlink inside the root that points out of
-/// it cannot be caught lexically. cap-std still blocks it, but it surfaces as
-/// `PermissionDenied` rather than `PathEscape`. Recorded in CONTRACT.md's
-/// behavior matrix and asserted by the `path_escape_symlink` conformance
-/// probe, so it stays a named decision rather than an accident.
-fn ensure_scoped(path: &Path) -> Result<()> {
-    if escapes_lexically(path) {
-        return Err(ContractError::PathEscape(path.display().to_string()));
-    }
-    Ok(())
-}
 
 fn to_metadata(m: cap_std::fs::Metadata) -> Metadata {
     Metadata {
@@ -78,53 +28,77 @@ fn to_metadata(m: cap_std::fs::Metadata) -> Metadata {
 /// methods can escape the directory it was opened on.
 pub struct Workspace {
     dir: cap_std::fs::Dir,
+    /// Kept so `canonicalize` can resolve against the real root. cap-std
+    /// deliberately does not expose the directory's own path.
+    root: PathBuf,
 }
 
 impl Workspace {
     pub fn open_ambient(root: &Path) -> Result<Self> {
         let dir = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
-        Ok(Workspace { dir })
+        Ok(Workspace {
+            dir,
+            root: root.to_path_buf(),
+        })
     }
 }
 
 impl FsRoot for Workspace {
-    fn stat(&self, path: &Path) -> Result<Metadata> {
-        ensure_scoped(path)?;
-        Ok(to_metadata(self.dir.metadata(path)?))
+    fn stat(&self, path: &ScopedPath) -> Result<Metadata> {
+        Ok(to_metadata(self.dir.metadata(as_host(path))?))
     }
 
-    fn read_dir(&self, path: &Path) -> Result<Vec<DirEntryInfo>> {
-        ensure_scoped(path)?;
-        let mut out = Vec::new();
-        for entry in self.dir.read_dir(path)? {
-            let entry = entry?;
-            out.push(DirEntryInfo {
-                name: entry.file_name().to_string_lossy().into_owned(),
-                metadata: to_metadata(entry.metadata()?),
-            });
-        }
-        Ok(out)
+    fn read_dir(&self, path: &ScopedPath) -> Result<Vec<DirEntryInfo>> {
+        collect_dir(self.dir.read_dir(as_host(path))?)
     }
 
-    fn read_to_string(&self, path: &Path) -> Result<String> {
-        ensure_scoped(path)?;
-        Ok(self.dir.read_to_string(path)?)
+    fn read_to_string(&self, path: &ScopedPath) -> Result<String> {
+        Ok(self.dir.read_to_string(as_host(path))?)
     }
 
-    fn write(&self, path: &Path, contents: &[u8]) -> Result<()> {
-        ensure_scoped(path)?;
-        Ok(self.dir.write(path, contents)?)
+    fn write(&self, path: &ScopedPath, contents: &[u8]) -> Result<()> {
+        Ok(self.dir.write(as_host(path), contents)?)
     }
 
-    fn create_dir(&self, path: &Path) -> Result<()> {
-        ensure_scoped(path)?;
-        Ok(self.dir.create_dir(path)?)
+    fn create_dir(&self, path: &ScopedPath) -> Result<()> {
+        Ok(self.dir.create_dir(as_host(path))?)
     }
 
-    fn remove_file(&self, path: &Path) -> Result<()> {
-        ensure_scoped(path)?;
-        Ok(self.dir.remove_file(path)?)
+    fn remove_file(&self, path: &ScopedPath) -> Result<()> {
+        Ok(self.dir.remove_file(as_host(path))?)
     }
+
+    fn read_dir_root(&self) -> Result<Vec<DirEntryInfo>> {
+        collect_dir(self.dir.read_dir(Path::new("."))?)
+    }
+
+    fn canonicalize(&self, path: &ScopedPath) -> Result<NativePath> {
+        // Resolved against the ambient root, then handed back opaque. On
+        // Windows this is the verbatim `\?\` form; the contract promises
+        // nothing about its spelling, which is the entire point of the type.
+        let resolved = std::fs::canonicalize(self.root.join(as_host(path)))?;
+        Ok(NativePath::from_host(resolved))
+    }
+}
+
+fn collect_dir(entries: cap_std::fs::ReadDir) -> Result<Vec<DirEntryInfo>> {
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        out.push(DirEntryInfo {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            metadata: to_metadata(entry.metadata()?),
+        });
+    }
+    Ok(out)
+}
+
+/// A `ScopedPath` is already validated: relative, `/`-separated, no `..`,
+/// no drive or UNC prefix, no `:` or `\`. `Path::new` on that string is
+/// correct on every host, because `/` is a separator everywhere and the
+/// spellings that would differ were rejected at construction.
+fn as_host(path: &ScopedPath) -> &Path {
+    Path::new(path.as_str())
 }
 
 struct StdFileLockGuard(std::fs::File);
@@ -137,10 +111,9 @@ impl LockGuard for StdFileLockGuard {
 }
 
 impl FileLock for Workspace {
-    fn lock_exclusive(&self, path: &Path) -> Result<Box<dyn LockGuard>> {
-        ensure_scoped(path)?;
+    fn lock_exclusive(&self, path: &ScopedPath) -> Result<Box<dyn LockGuard>> {
         let file = self.dir.open_with(
-            path,
+            as_host(path),
             cap_std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -151,10 +124,9 @@ impl FileLock for Workspace {
         Ok(Box::new(StdFileLockGuard(file)))
     }
 
-    fn lock_shared(&self, path: &Path) -> Result<Box<dyn LockGuard>> {
-        ensure_scoped(path)?;
+    fn lock_shared(&self, path: &ScopedPath) -> Result<Box<dyn LockGuard>> {
         let file = self.dir.open_with(
-            path,
+            as_host(path),
             cap_std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -392,81 +364,65 @@ impl StandardDirs for NativeStandardDirs {
 mod tests {
     use super::*;
 
+    fn sp(s: &str) -> ScopedPath {
+        ScopedPath::new(s).expect("valid scoped path")
+    }
+
     #[test]
     fn workspace_scoped_fs_roundtrip() {
         let tmp = std::env::temp_dir().join(format!("compat-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let ws = Workspace::open_ambient(&tmp).unwrap();
 
-        ws.write(Path::new("hello.txt"), b"hi").unwrap();
-        assert_eq!(ws.read_to_string(Path::new("hello.txt")).unwrap(), "hi");
+        ws.write(&sp("hello.txt"), b"hi").unwrap();
+        assert_eq!(ws.read_to_string(&sp("hello.txt")).unwrap(), "hi");
 
-        let meta = ws.stat(Path::new("hello.txt")).unwrap();
+        let meta = ws.stat(&sp("hello.txt")).unwrap();
         assert_eq!(meta.len, 2);
         assert!(!meta.is_dir);
 
-        let entries = ws.read_dir(Path::new(".")).unwrap();
+        let entries = ws.read_dir_root().unwrap();
         assert!(entries.iter().any(|e| e.name == "hello.txt"));
 
-        ws.remove_file(Path::new("hello.txt")).unwrap();
+        ws.remove_file(&sp("hello.txt")).unwrap();
         std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
-    fn escaping_paths_return_path_escape_not_a_raw_denial() {
-        let tmp = std::env::temp_dir().join(format!("compat-escape-{}", std::process::id()));
-        std::fs::create_dir_all(tmp.join("inner")).unwrap();
-        std::fs::write(tmp.join("outside.txt"), b"secret").unwrap();
-        let ws = Workspace::open_ambient(&tmp.join("inner")).unwrap();
+    fn canonicalize_produces_a_native_path_the_contract_does_not_shape() {
+        // The point of `NativePath` is that its spelling is the host's
+        // business. All the contract promises is that it resolves and that
+        // the human rendering is readable — notably *not* that the two are
+        // the same string, which is what the old promise implied.
+        let tmp = std::env::temp_dir().join(format!("compat-canon-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let ws = Workspace::open_ambient(&tmp).unwrap();
+        ws.write(&sp("f.txt"), b"x").unwrap();
 
-        // Every scoped method must classify an escape identically. Before
-        // this guard existed, cap-std surfaced all of these as
-        // `PermissionDenied`, making `PathEscape` unreachable.
-        let up = Path::new("../outside.txt");
-        assert!(matches!(ws.stat(up), Err(ContractError::PathEscape(_))));
-        assert!(matches!(
-            ws.read_to_string(up),
-            Err(ContractError::PathEscape(_))
-        ));
-        assert!(matches!(
-            ws.write(up, b"x"),
-            Err(ContractError::PathEscape(_))
-        ));
-        assert!(matches!(
-            ws.create_dir(Path::new("../newdir")),
-            Err(ContractError::PathEscape(_))
-        ));
-        assert!(matches!(
-            ws.remove_file(up),
-            Err(ContractError::PathEscape(_))
-        ));
-        assert!(matches!(
-            ws.read_dir(Path::new("..")),
-            Err(ContractError::PathEscape(_))
-        ));
-
-        // An absolute path is not scoped to the root at all, even when it
-        // happens to point inside it.
-        let abs = tmp.join("outside.txt");
-        assert!(matches!(ws.stat(&abs), Err(ContractError::PathEscape(_))));
+        let native = ws.canonicalize(&sp("f.txt")).unwrap();
+        assert!(native.as_os_path().is_absolute());
+        let shown = native.display_for_humans();
+        assert!(shown.ends_with("f.txt"), "unexpected rendering: {shown}");
+        assert!(
+            !shown.starts_with(r"\?\"),
+            "the human rendering must drop the verbatim prefix: {shown}"
+        );
 
         std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
-    fn interior_parent_dir_still_resolves() {
-        // `a/../b` never leaves the root. cap-std accepts it, so the guard
-        // must not reject it — the check simulates `..` rather than banning it.
-        let tmp = std::env::temp_dir().join(format!("compat-interior-{}", std::process::id()));
-        std::fs::create_dir_all(tmp.join("a")).unwrap();
-        std::fs::create_dir_all(tmp.join("b")).unwrap();
-        std::fs::write(tmp.join("b").join("f.txt"), b"inside").unwrap();
+    fn nested_paths_resolve_through_the_scoped_root() {
+        let tmp = std::env::temp_dir().join(format!("compat-nested-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
         let ws = Workspace::open_ambient(&tmp).unwrap();
 
-        assert_eq!(
-            ws.read_to_string(Path::new("a/../b/f.txt")).unwrap(),
-            "inside"
-        );
+        ws.create_dir(&sp("a")).unwrap();
+        ws.write(&sp("a/b.txt"), b"nested").unwrap();
+        assert_eq!(ws.read_to_string(&sp("a/b.txt")).unwrap(), "nested");
+
+        let listed = ws.read_dir(&sp("a")).unwrap();
+        assert!(listed.iter().any(|e| e.name == "b.txt"));
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -477,7 +433,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let ws = Workspace::open_ambient(&tmp).unwrap();
 
-        let guard = ws.lock_exclusive(Path::new("lockfile")).unwrap();
+        let guard = ws.lock_exclusive(&sp("lockfile")).unwrap();
         // A second, independently-opened handle must not acquire the same
         // exclusive lock while `guard` is held.
         let second = std::fs::OpenOptions::new()
