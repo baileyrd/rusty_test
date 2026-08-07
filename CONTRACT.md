@@ -192,7 +192,11 @@ this section and fails on drift.*
 | Primitive | Windows | Linux | macOS |
 |---|---|---|---|
 | Scoped fs ops (write/read/stat/list/remove) | supported | supported | supported |
-| Scoped-root escape -> `PathEscape` | supported | supported | supported |
+| Escaping spellings unrepresentable (`ScopedPath`) | supported | supported | supported |
+| Scoped-root filename case collision | varies | varies | varies |
+| Reserved device names in a scoped root | varies | varies | varies |
+| `:` rejected before the filesystem (ADS) | supported | supported | supported |
+| Native canonical path shape (no `/` promise) | normalized | supported | supported |
 | Scoped-root escape via symlink | varies | normalized | normalized |
 | Symlink creation (probed, not assumed) | varies | supported | supported |
 | Process spawn + stdout/stderr/exit capture | supported | supported | supported |
@@ -206,6 +210,8 @@ this section and fails on drift.*
 
 ### Conditions for `varies` rows
 
+- **Scoped-root filename case collision** — filesystem case sensitivity is a property of the volume, not the OS; a name-keyed allow-list is bypassable by case wherever names collide
+- **Reserved device names in a scoped root** — Windows reserves CON/NUL/PRN/AUX/COM*/LPT*; Unix treats them as ordinary filenames, so the same create succeeds or fails per host
 - **Scoped-root escape via symlink** — reachable only where symlink creation is, so on Windows it inherits that OS's privilege gate; cap-std blocks the escape wherever the shape exists
 - **Symlink creation (probed, not assumed)** — on Windows, available with Developer Mode or SeCreateSymbolicLinkPrivilege and otherwise unavailable; unconditional on Linux and macOS
 
@@ -213,8 +219,12 @@ this section and fails on drift.*
 
 **Windows**
 
-- `fs_scoped_ops` — supported: write/read/stat/create_dir/read_dir/remove all behave identically
-- `fs_escape_lexical` — supported: 5 escape shapes classified `PathEscape`; interior `a/../b` still resolves
+- `fs_scoped_ops` — supported: write/read/stat/create_dir/read_dir_root/remove all behave identically
+- `fs_escape_construction` — supported: 4 escaping spellings rejected `PathEscape`, 6 non-portable rejected `InvalidPath`
+- `path_case_collision` — varies: `Collide.txt` and `collide.txt` are the SAME file on this host
+- `path_device_names` — varies: CON: refused (NotFound); NUL: refused (NotFound)
+- `path_ads_unrepresentable` — supported: `:` rejected by ScopedPath on every host — the ADS/filename divergence it would cause is not observable at runtime, so it cannot be a measured row
+- `path_native_canonical` — normalized: native is verbatim-prefixed; human rendering drops the verbatim prefix
 - `fs_escape_symlink` — varies: blocked by cap-std, surfaced as `PermissionDenied` (not `PathEscape`)
 - `fs_symlink_create` — varies: symlink created and resolved; Capabilities::symlinks = true
 - `proc_spawn_capture` — supported: stdout, stderr, and exit status 7 all captured separately
@@ -228,8 +238,12 @@ this section and fails on drift.*
 
 **Linux**
 
-- `fs_scoped_ops` — supported: write/read/stat/create_dir/read_dir/remove all behave identically
-- `fs_escape_lexical` — supported: 5 escape shapes classified `PathEscape`; interior `a/../b` still resolves
+- `fs_scoped_ops` — supported: write/read/stat/create_dir/read_dir_root/remove all behave identically
+- `fs_escape_construction` — supported: 4 escaping spellings rejected `PathEscape`, 6 non-portable rejected `InvalidPath`
+- `path_case_collision` — varies: `Collide.txt` and `collide.txt` are DISTINCT files on this host
+- `path_device_names` — varies: CON: ordinary file; NUL: ordinary file
+- `path_ads_unrepresentable` — supported: `:` rejected by ScopedPath on every host — the ADS/filename divergence it would cause is not observable at runtime, so it cannot be a measured row
+- `path_native_canonical` — supported: native is `/`-separated; human rendering equals the native spelling (nothing to strip)
 - `fs_escape_symlink` — normalized: blocked by cap-std, surfaced as `PermissionDenied` (not `PathEscape`)
 - `fs_symlink_create` — supported: symlink created and resolved; Capabilities::symlinks = true
 - `proc_spawn_capture` — supported: stdout, stderr, and exit status 7 all captured separately
@@ -243,8 +257,12 @@ this section and fails on drift.*
 
 **macOS**
 
-- `fs_scoped_ops` — supported: write/read/stat/create_dir/read_dir/remove all behave identically
-- `fs_escape_lexical` — supported: 5 escape shapes classified `PathEscape`; interior `a/../b` still resolves
+- `fs_scoped_ops` — supported: write/read/stat/create_dir/read_dir_root/remove all behave identically
+- `fs_escape_construction` — supported: 4 escaping spellings rejected `PathEscape`, 6 non-portable rejected `InvalidPath`
+- `path_case_collision` — varies: `Collide.txt` and `collide.txt` are the SAME file on this host
+- `path_device_names` — varies: CON: ordinary file; NUL: ordinary file
+- `path_ads_unrepresentable` — supported: `:` rejected by ScopedPath on every host — the ADS/filename divergence it would cause is not observable at runtime, so it cannot be a measured row
+- `path_native_canonical` — supported: native is `/`-separated; human rendering equals the native spelling (nothing to strip)
 - `fs_escape_symlink` — normalized: blocked by cap-std, surfaced as `PermissionDenied` (not `PathEscape`)
 - `fs_symlink_create` — supported: symlink created and resolved; Capabilities::symlinks = true
 - `proc_spawn_capture` — supported: stdout, stderr, and exit status 7 all captured separately
