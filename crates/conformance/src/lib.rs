@@ -544,6 +544,28 @@ fn probe_fs_escape_symlink() -> Result<(Verdict, String), String> {
         Err(err) => error_category(err),
     };
 
+    // Every operation that *resolves* a path has to hold the boundary, not
+    // just the ones that read bytes. `canonicalize` was added after this
+    // probe existed and escaped its evidence entirely: it reached around the
+    // sandbox and returned a host path outside the root. Reading was blocked
+    // the whole time, so the original probe stayed green through the bug.
+    let canonical = ws.canonicalize(&sp("link")?);
+    let canonical_note = match &canonical {
+        Ok(native) => {
+            let resolved = native.as_os_path().to_path_buf();
+            let real_root = std::fs::canonicalize(&root).map_err(|e| e.to_string())?;
+            if !resolved.starts_with(&real_root) {
+                std::fs::remove_dir_all(&tmp).ok();
+                return Err(format!(
+                    "SECURITY: canonicalize resolved outside the scoped root: {}",
+                    resolved.display()
+                ));
+            }
+            "canonicalize stayed inside the root".to_string()
+        }
+        Err(err) => format!("canonicalize refused ({})", error_category(err)),
+    };
+
     std::fs::remove_dir_all(&tmp).ok();
     // Blocked, but reported as PermissionDenied rather than PathEscape: the
     // lexical guard cannot see through a symlink, so cap-std's own denial is
@@ -555,7 +577,9 @@ fn probe_fs_escape_symlink() -> Result<(Verdict, String), String> {
     };
     Ok((
         symlink_summary_verdict(measured),
-        format!("blocked by cap-std, surfaced as `{result}` (not `PathEscape`)"),
+        format!(
+            "read blocked by cap-std, surfaced as `{result}` (not `PathEscape`); {canonical_note}"
+        ),
     ))
 }
 

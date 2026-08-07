@@ -73,10 +73,20 @@ impl FsRoot for Workspace {
     }
 
     fn canonicalize(&self, path: &ScopedPath) -> Result<NativePath> {
-        // Resolved against the ambient root, then handed back opaque. On
-        // Windows this is the verbatim `\?\` form; the contract promises
-        // nothing about its spelling, which is the entire point of the type.
-        let resolved = std::fs::canonicalize(self.root.join(as_host(path)))?;
+        // MUST resolve through the capability-scoped `Dir`, never through
+        // `std::fs::canonicalize(self.root.join(..))`. The latter reaches
+        // around the sandbox: `link/outside.txt` is a perfectly valid
+        // `ScopedPath` — the type cannot see through a symlink — so an
+        // in-root symlink resolves to a host path outside the root and gets
+        // handed back as a `NativePath`. Measured, not hypothetical: the
+        // earlier version returned `/tmp/.../outside.txt` for a root of
+        // `/tmp/.../root`.
+        //
+        // `Dir::canonicalize` resolves symlinks *inside* the sandbox and
+        // returns a root-relative path, so joining it back onto the root is
+        // safe by construction rather than by a prefix check afterwards.
+        let inside = self.dir.canonicalize(as_host(path))?;
+        let resolved = std::fs::canonicalize(&self.root)?.join(inside);
         Ok(NativePath::from_host(resolved))
     }
 }
@@ -409,6 +419,60 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Creates a symlink if the host allows it, reporting whether it could.
+    fn try_symlink(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link).is_ok()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (target, link);
+            false
+        }
+    }
+
+    #[test]
+    fn canonicalize_does_not_escape_through_an_in_root_symlink() {
+        // The scoped root's whole purpose. `link` is a perfectly valid
+        // `ScopedPath` — the type cannot see through a symlink — so this can
+        // only be enforced during resolution, by the adapter.
+        let tmp = std::env::temp_dir().join(format!("compat-canon-esc-{}", std::process::id()));
+        let root = tmp.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(tmp.join("outside.txt"), b"secret").unwrap();
+
+        if !try_symlink(&tmp.join("outside.txt"), &root.join("link")) {
+            // No symlink privilege on this host; the escape shape is
+            // unreachable here and CI's other hosts cover it.
+            std::fs::remove_dir_all(&tmp).ok();
+            return;
+        }
+
+        let ws = Workspace::open_ambient(&root).unwrap();
+        let outcome = ws.canonicalize(&sp("link"));
+        let escaped = match &outcome {
+            Ok(native) => {
+                let shown = native.as_os_path().to_path_buf();
+                // Anything resolving outside the root is an escape, however
+                // it is spelled.
+                !shown.starts_with(std::fs::canonicalize(&root).unwrap())
+            }
+            Err(_) => false,
+        };
+        std::fs::remove_dir_all(&tmp).ok();
+
+        assert!(
+            !escaped,
+            "canonicalize resolved an in-root symlink to a host path outside the \
+             scoped root: {outcome:?}"
+        );
     }
 
     #[test]
