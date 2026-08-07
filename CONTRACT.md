@@ -225,7 +225,7 @@ this section and fails on drift.*
 - `path_device_names` — varies: CON: refused (NotFound); NUL: refused (NotFound)
 - `path_ads_unrepresentable` — supported: `:` rejected by ScopedPath on every host — the ADS/filename divergence it would cause is not observable at runtime, so it cannot be a measured row
 - `path_native_canonical` — normalized: native is verbatim-prefixed; human rendering drops the verbatim prefix
-- `fs_escape_symlink` — varies: blocked by cap-std, surfaced as `PermissionDenied` (not `PathEscape`)
+- `fs_escape_symlink` — varies: read blocked by cap-std, surfaced as `PermissionDenied` (not `PathEscape`); canonicalize refused (PermissionDenied)
 - `fs_symlink_create` — varies: symlink created and resolved; Capabilities::symlinks = true
 - `proc_spawn_capture` — supported: stdout, stderr, and exit status 7 all captured separately
 - `proc_env_isolation` — supported: inherit_env true passes parent env; false yields an empty env
@@ -244,7 +244,7 @@ this section and fails on drift.*
 - `path_device_names` — varies: CON: ordinary file; NUL: ordinary file
 - `path_ads_unrepresentable` — supported: `:` rejected by ScopedPath on every host — the ADS/filename divergence it would cause is not observable at runtime, so it cannot be a measured row
 - `path_native_canonical` — supported: native is `/`-separated; human rendering equals the native spelling (nothing to strip)
-- `fs_escape_symlink` — normalized: blocked by cap-std, surfaced as `PermissionDenied` (not `PathEscape`)
+- `fs_escape_symlink` — normalized: read blocked by cap-std, surfaced as `PermissionDenied` (not `PathEscape`); canonicalize refused (PermissionDenied)
 - `fs_symlink_create` — supported: symlink created and resolved; Capabilities::symlinks = true
 - `proc_spawn_capture` — supported: stdout, stderr, and exit status 7 all captured separately
 - `proc_env_isolation` — supported: inherit_env true passes parent env; false yields an empty env
@@ -263,7 +263,7 @@ this section and fails on drift.*
 - `path_device_names` — varies: CON: ordinary file; NUL: ordinary file
 - `path_ads_unrepresentable` — supported: `:` rejected by ScopedPath on every host — the ADS/filename divergence it would cause is not observable at runtime, so it cannot be a measured row
 - `path_native_canonical` — supported: native is `/`-separated; human rendering equals the native spelling (nothing to strip)
-- `fs_escape_symlink` — normalized: blocked by cap-std, surfaced as `PermissionDenied` (not `PathEscape`)
+- `fs_escape_symlink` — normalized: read blocked by cap-std, surfaced as `PermissionDenied` (not `PathEscape`); canonicalize refused (PermissionDenied)
 - `fs_symlink_create` — supported: symlink created and resolved; Capabilities::symlinks = true
 - `proc_spawn_capture` — supported: stdout, stderr, and exit status 7 all captured separately
 - `proc_env_isolation` — supported: inherit_env true passes parent env; false yields an empty env
