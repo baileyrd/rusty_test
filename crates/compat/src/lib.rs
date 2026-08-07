@@ -421,37 +421,85 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// Creates a symlink if the host allows it, reporting whether it could.
-    fn try_symlink(target: &Path, link: &Path) -> bool {
+    /// Creates a symlink, returning the host's refusal rather than a bare
+    /// bool so a caller can assert *why* it could not.
+    fn try_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink(target, link).is_ok()
+            std::os::unix::fs::symlink(target, link)
         }
         #[cfg(windows)]
         {
-            std::os::windows::fs::symlink_file(target, link).is_ok()
+            std::os::windows::fs::symlink_file(target, link)
         }
         #[cfg(not(any(unix, windows)))]
         {
             let _ = (target, link);
-            false
+            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
         }
     }
 
     #[test]
-    fn canonicalize_does_not_escape_through_an_in_root_symlink() {
-        // The scoped root's whole purpose. `link` is a perfectly valid
-        // `ScopedPath` — the type cannot see through a symlink — so this can
-        // only be enforced during resolution, by the adapter.
+    fn canonicalize_stays_in_root_for_an_ordinary_nested_path() {
+        // Unconditional: every host runs this, so the resolver is never
+        // wholly untested even where the symlink shape below is unreachable.
+        let tmp = std::env::temp_dir().join(format!("compat-canon-in-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("a")).unwrap();
+        let ws = Workspace::open_ambient(&tmp).unwrap();
+        ws.write(&sp("a/b.txt"), b"x").unwrap();
+
+        let native = ws.canonicalize(&sp("a/b.txt")).unwrap();
+        let real_root = std::fs::canonicalize(&tmp).unwrap();
+        assert!(
+            native.as_os_path().starts_with(&real_root),
+            "canonicalize left the root for an ordinary path: {native:?}"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn canonicalize_blocks_symlink_escape_where_symlinks_are_available() {
+        // The name states the condition, because on a host without symlink
+        // privilege the escape shape genuinely cannot be built. The previous
+        // version claimed the unconditional property and then returned early
+        // and silently on those hosts — `cargo test` printed `ok` for a run
+        // that had asserted nothing. That is the same defect as the rest of
+        // today: a check whose name reaches further than its assertions.
+        //
+        // So the unreachable branch now asserts *why* it is unreachable
+        // rather than just leaving. Every run of this test verifies
+        // something real.
         let tmp = std::env::temp_dir().join(format!("compat-canon-esc-{}", std::process::id()));
         let root = tmp.join("root");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(tmp.join("outside.txt"), b"secret").unwrap();
 
-        if !try_symlink(&tmp.join("outside.txt"), &root.join("link")) {
-            // No symlink privilege on this host; the escape shape is
-            // unreachable here and CI's other hosts cover it.
+        if let Err(e) = try_symlink(&tmp.join("outside.txt"), &root.join("link")) {
             std::fs::remove_dir_all(&tmp).ok();
+            // A refusal is only an acceptable reason to stop if it is the
+            // host declining to create symlinks. Anything else means the
+            // fixture broke and the test would otherwise pass vacuously.
+            //
+            // Windows reports `ERROR_PRIVILEGE_NOT_HELD` (1314) for this, and
+            // Rust maps it to `ErrorKind::Uncategorized` — which is not
+            // matchable on stable, so the raw code is the only precise
+            // discriminator. Measured on a Windows 11 host without the
+            // privilege; assuming `PermissionDenied` here was wrong.
+            const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+            let refused_for_privilege = matches!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+            ) || e.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD);
+            assert!(
+                refused_for_privilege,
+                "symlink creation failed for an unexpected reason, so this test \
+                 asserted nothing: {e:?}"
+            );
+            eprintln!(
+                "SKIPPED escape shape: this host cannot create symlinks ({e}). \
+                 The `fs_escape_symlink` conformance probe reports the same skip \
+                 explicitly, and CI hosts with the privilege do exercise it."
+            );
             return;
         }
 
