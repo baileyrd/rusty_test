@@ -1,5 +1,7 @@
 # portable-runtime-contract
 
+> **Archived — merged into [Rusty Mill](https://github.com/Rusty-Mill/rusty_mill).** This crate now lives at [`crates/rusty_test`](https://github.com/Rusty-Mill/rusty_mill/tree/main/crates/rusty_test) in the Rusty Mill monorepo, which is where active development, issues, and pull requests happen now. This standalone repo is kept for historical reference only.
+
 Phase 0 spike for a cross-platform tool runtime: one execution contract,
 per-host adapters — write a tool once, run it the same way on Windows,
 Linux, and macOS.
